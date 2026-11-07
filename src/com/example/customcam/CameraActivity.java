@@ -10,8 +10,12 @@ import android.hardware.Camera;
 import android.media.MediaScannerConnection;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.OrientationEventListener;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -52,6 +56,12 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
     static final String[] BAR_LABELS = {"ISO", "WB", "Focus", "EV", "Flash", "Scene"};
     static final String[] BAR_KEYS = {"iso", "wb", "focus", "ev", "flash", "scene"};
     private LinearLayout bar;
+    private FocusView focusView;
+    private final Handler handler = new Handler();
+    private boolean focusing;
+    private boolean noAfToastShown;
+    private OrientationEventListener orientListener;
+    private int deviceOrientation = 0;
     private HorizontalScrollView barScroll;
 
     @Override
@@ -68,6 +78,15 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
         holder.addCallback(this);
         holder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS); // required before Android 3.0
         root.addView(sv, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.FILL_PARENT, FrameLayout.LayoutParams.FILL_PARENT));
+        sv.setOnTouchListener(new View.OnTouchListener() {
+            public boolean onTouch(View v, MotionEvent e) {
+                if (e.getAction() == MotionEvent.ACTION_UP) focusOnly(e.getX(), e.getY());
+                return true;
+            }
+        });
+        focusView = new FocusView(this);
+        root.addView(focusView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.FILL_PARENT, FrameLayout.LayoutParams.FILL_PARENT));
 
         shutter = new ShutterView(this);
@@ -100,8 +119,178 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
                 FrameLayout.LayoutParams.FILL_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM));
 
+        orientListener = new OrientationEventListener(this) {
+            @Override
+            public void onOrientationChanged(int o) {
+                if (o == ORIENTATION_UNKNOWN) return;
+                deviceOrientation = ((o + 45) / 90 * 90) % 360;
+            }
+        };
+
         setContentView(root);
         applyShutterStyle();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (orientListener.canDetectOrientation()) orientListener.enable();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        orientListener.disable();
+    }
+
+    // Preview rotation so the picture is upright whichever way the phone is held
+    private int displayOrientation() {
+        int deg = 0;
+        switch (getWindowManager().getDefaultDisplay().getRotation()) {
+            case Surface.ROTATION_90: deg = 90; break;
+            case Surface.ROTATION_180: deg = 180; break;
+            case Surface.ROTATION_270: deg = 270; break;
+        }
+        return (90 - deg + 360) % 360;
+    }
+
+    // Rotation stored in the saved JPEG (EXIF) so viewers show it upright
+    private int photoRotation() {
+        return (90 + deviceOrientation + prefs.getInt("rotfix", 0) * 90) % 360;
+    }
+
+    // Box in the middle of the preview: white = focusing, green = locked, red = failed
+    static class FocusView extends View {
+        private final Paint paint = new Paint();
+        private int state; // 0 hidden, 1 focusing, 2 ok, 3 failed
+        private float px = -1, py = -1;
+
+        void setPoint(float x, float y) {
+            px = x;
+            py = y;
+        }
+
+        FocusView(android.content.Context c) {
+            super(c);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(3);
+        }
+
+        void setState(int s) {
+            state = s;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            if (state == 0) return;
+            paint.setColor(state == 2 ? 0xFF43A047 : state == 3 ? 0xFFE53935 : 0xFFFFFFFF);
+            float cx = px >= 0 ? px : getWidth() / 2f;
+            float cy = py >= 0 ? py : getHeight() / 2f;
+            float r = Math.min(getWidth(), getHeight()) / 7f;
+            c.drawRect(cx - r, cy - r, cx + r, cy + r, paint);
+        }
+    }
+
+    private final Runnable hideFocus = new Runnable() {
+        public void run() {
+            focusView.setState(0);
+        }
+    };
+
+    private boolean supportsAutoFocus(Camera.Parameters p) {
+        List<String> fm = p.getSupportedFocusModes();
+        return fm != null && (fm.contains(Camera.Parameters.FOCUS_MODE_AUTO)
+                || fm.contains(Camera.Parameters.FOCUS_MODE_MACRO));
+    }
+
+    private boolean noPointToastShown;
+
+    // Ask the driver to focus at a screen point. Android 2.2 has no such API, so this only
+    // works if the phone's driver happens to support the newer one; otherwise returns false.
+    private boolean setFocusPoint(Camera.Parameters p, float x, float y) {
+        try {
+            int w = focusView.getWidth(), h = focusView.getHeight();
+            if (w == 0 || h == 0) return false;
+            android.graphics.Matrix m = new android.graphics.Matrix();
+            m.postRotate(displayOrientation());
+            m.postScale(w / 2000f, h / 2000f);
+            m.postTranslate(w / 2f, h / 2f);
+            android.graphics.Matrix inv = new android.graphics.Matrix();
+            if (!m.invert(inv)) return false;
+            float[] pt = {x, y};
+            inv.mapPoints(pt);
+            int cx = (int) pt[0], cy = (int) pt[1];
+            android.graphics.Rect r = new android.graphics.Rect(
+                    Math.max(-1000, cx - 100), Math.max(-1000, cy - 100),
+                    Math.min(1000, cx + 100), Math.min(1000, cy + 100));
+            Class<?> areaCls = Class.forName("android.hardware.Camera$Area");
+            Object area = areaCls.getConstructor(android.graphics.Rect.class, int.class)
+                    .newInstance(r, 1000);
+            List<Object> list = new ArrayList<Object>();
+            list.add(area);
+            Camera.Parameters.class.getMethod("setFocusAreas", List.class).invoke(p, list);
+            return true;
+        } catch (Throwable ex) {
+            return false;
+        }
+    }
+
+    // Tap on the preview: autofocus (at the tapped point if the driver allows, else the centre)
+    private void focusOnly(float x, float y) {
+        if (camera == null || busy || !previewing || focusing) return;
+        try {
+            Camera.Parameters p = camera.getParameters();
+            if (!supportsAutoFocus(p)) {
+                if (!noAfToastShown) {
+                    noAfToastShown = true;
+                    Toast.makeText(this, "This camera reports no autofocus (fixed focus)",
+                            Toast.LENGTH_LONG).show();
+                }
+                return;
+            }
+            String fmode = p.getFocusMode();
+            if (!Camera.Parameters.FOCUS_MODE_AUTO.equals(fmode)
+                    && !Camera.Parameters.FOCUS_MODE_MACRO.equals(fmode)) {
+                p.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+            }
+            boolean pointed = setFocusPoint(p, x, y);
+            camera.setParameters(p);
+            if (pointed) {
+                focusView.setPoint(x, y);
+            } else {
+                focusView.setPoint(-1, -1);
+                if (!noPointToastShown) {
+                    noPointToastShown = true;
+                    Toast.makeText(this, "This phone can't focus on a tapped point; using the centre",
+                            Toast.LENGTH_LONG).show();
+                }
+            }
+            focusing = true;
+            handler.removeCallbacks(hideFocus);
+            focusView.setState(1);
+            camera.cancelAutoFocus();
+            camera.autoFocus(new Camera.AutoFocusCallback() {
+                public void onAutoFocus(boolean ok, Camera c) {
+                    focusing = false;
+                    focusView.setState(ok ? 2 : 3);
+                    handler.postDelayed(hideFocus, 900);
+                }
+            });
+        } catch (Exception e) {
+            focusing = false;
+            focusView.setState(0);
+        }
+    }
+
+    private void showParams() {
+        if (camera == null) return;
+        String text = camera.getParameters().flatten().replace(";", "\n");
+        new AlertDialog.Builder(this)
+                .setTitle("Camera parameters")
+                .setMessage(text)
+                .setPositiveButton("Close", null)
+                .show();
     }
 
     // ---------------- shutter button ----------------
@@ -194,8 +383,10 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
     private void startPreview() {
         if (camera == null) return;
         try {
+            focusing = false;
             if (previewing) camera.stopPreview();
             configure();
+            camera.setDisplayOrientation(displayOrientation());
             camera.startPreview();
             previewing = true;
             busy = false;
@@ -246,7 +437,7 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
             if (pv != null) p.setPreviewSize(pv.width, pv.height);
 
             p.setJpegQuality(QUALITIES[prefs.getInt("q", 2)]);
-            p.setRotation(0);
+            p.setRotation(photoRotation());
 
             String fx = prefs.getString("fx", null);
             List<String> fxs = p.getSupportedColorEffects();
@@ -279,18 +470,55 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
         busy = true;
         final int fmt = prefs.getInt("fmt", 0);
         try {
+            Camera.Parameters rp = camera.getParameters();
+            rp.setRotation(photoRotation());
+            camera.setParameters(rp);
+        } catch (Exception ignored) {
+        }
+        try {
             String fmode = camera.getParameters().getFocusMode();
             if (Camera.Parameters.FOCUS_MODE_AUTO.equals(fmode)
                     || Camera.Parameters.FOCUS_MODE_MACRO.equals(fmode)) {
+                final boolean[] done = {false};
+                final Runnable go = new Runnable() {
+                    public void run() {
+                        if (done[0]) return;
+                        done[0] = true;
+                        focusing = false;
+                        shoot(fmt);
+                        handler.postDelayed(hideFocus, 700);
+                    }
+                };
+                final Runnable timeout = new Runnable() {
+                    public void run() {
+                        if (camera != null) {
+                            try {
+                                camera.cancelAutoFocus();
+                            } catch (Exception ignored) {
+                            }
+                        }
+                        focusView.setState(3);
+                        go.run();
+                    }
+                };
+                focusing = true;
+                handler.removeCallbacks(hideFocus);
+                focusView.setPoint(-1, -1);
+                focusView.setState(1);
+                camera.cancelAutoFocus();
+                handler.postDelayed(timeout, 3000);
                 camera.autoFocus(new Camera.AutoFocusCallback() {
                     public void onAutoFocus(boolean ok, Camera c) {
-                        shoot(fmt);
+                        handler.removeCallbacks(timeout);
+                        focusView.setState(ok ? 2 : 3);
+                        go.run();
                     }
                 });
             } else {
                 shoot(fmt);
             }
         } catch (Exception e) {
+            focusing = false;
             busy = false;
         }
     }
@@ -393,14 +621,20 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
                 "Picture size: " + curSize,
                 "White balance: " + curWb,
                 "Color effect: " + curFx,
-                "JPEG quality: " + QUALITIES[prefs.getInt("q", 2)]
+                "JPEG quality: " + QUALITIES[prefs.getInt("q", 2)],
+                "Photo rotation fix: " + (prefs.getInt("rotfix", 0) * 90) + " deg",
+                "Show camera parameters"
         };
         new AlertDialog.Builder(this)
                 .setTitle("Settings (tap to change)")
                 .setItems(items, new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface d, int which) {
-                        changeSetting(which);
-                        showSettings();
+                        if (which == 10) {
+                            showParams();
+                        } else {
+                            changeSetting(which);
+                            showSettings();
+                        }
                     }
                 })
                 .setNegativeButton("Close", null)
@@ -453,6 +687,9 @@ public class CameraActivity extends Activity implements SurfaceHolder.Callback {
             case 8:
                 e.putInt("q", (prefs.getInt("q", 2) + 1) % QUALITIES.length);
                 reconfigure = true;
+                break;
+            case 9:
+                e.putInt("rotfix", (prefs.getInt("rotfix", 0) + 1) % 4);
                 break;
         }
         e.commit();
