@@ -1,0 +1,45 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Install Android platform and build-tools
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "build-tools;30.0.3"
+          "$SDKM" "platforms;android-8" || "$SDKM" "platforms;android-19"
+          if [ -f "$ANDROID_HOME/platforms/android-8/android.jar" ]; then
+            echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-8/android.jar" >> "$GITHUB_ENV"
+          else
+            echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-19/android.jar" >> "$GITHUB_ENV"
+          fi
+          echo "BUILD_TOOLS=$ANDROID_HOME/build-tools/30.0.3" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload APK and JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: customcam
+          path: |
+            out/customcam.apk
+            out/customcam.jar
